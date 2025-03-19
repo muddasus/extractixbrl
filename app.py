@@ -1,111 +1,22 @@
 import streamlit as st
 import pandas as pd
 import re
-import os
-from sec_api import QueryApi, XbrlApi
+import json
+import io
+from sec_api import XbrlApi
 
-# SEC API Keys
-QUERY_API_KEY = "a1293bb279cf316f31123670887b10c1fad2c098a90ff5bae1e3868ab327cf8f"
-xbrlApi = XbrlApi(QUERY_API_KEY)
-queryApi = QueryApi(QUERY_API_KEY)
-
-CLASS_MAPPING_FILE = "class_series_mapping.csv"
+# Initialize the XBRL API
+xbrlApi = XbrlApi("a1293bb279cf316f31123670887b10c1fad2c098a90ff5bae1e3868ab327cf8f")
 
 # Function to extract classid
 def extract_classid(segment_value):
     match = re.findall(r'C\d{9}', str(segment_value))
     return match[0] if match else None
 
-def fetch_filings(form_types, from_date, to_date):
-    """Fetches filings from SEC based on form type and date range."""
-    st.write("🔍 Fetching filings from SEC...")
-    
-    form_query = " OR ".join([f'formType:"{ft}"' for ft in form_types])
-    search_query = f'({form_query}) AND filedAt:[{from_date} TO {to_date}]'
-    
-    search_params = {
-        "query": search_query,
-        "from": "0",
-        "size": "50",
-        "sort": [{"filedAt": {"order": "desc"}}],
-    }
-    
-    filing_urls = []
-    
-    try:
-        while True:
-            search_results = queryApi.get_filings(search_params)
-            if not search_results or "filings" not in search_results:
-                break
-
-            filings = search_results["filings"]
-            if not filings:
-                break
-
-            metadata = [
-                {
-                    "ticker": f.get("ticker", "N/A"),
-                    "cik": f.get("cik", "Unknown"),
-                    "filedAt": f.get("filedAt", "Unknown"),
-                    "accessionNo": f.get("accessionNo", "Unknown"),
-                    "filingURL": f.get("linkToFilingDetails", "No URL"),
-                }
-                for f in filings
-            ]
-            filing_urls.extend(metadata)
-            search_params["from"] = str(int(search_params["from"]) + int(search_params["size"]))
-
-        df = pd.DataFrame(filing_urls)
-        if not df.empty:
-            st.success(f"✅ Successfully retrieved {len(df)} filings from SEC.")
-        return df
-
-    except Exception as e:
-        st.error(f"❌ Error fetching filings: {str(e)}")
-        return pd.DataFrame()
-
-def extract_ixbrl_data(filing_url):
-    """Extracts IXBRL data from a given filing URL."""
-    try:
-        xbrl_json = xbrlApi.xbrl_to_json(htm_url=filing_url)
-        if "ExpenseRatioPct" not in xbrl_json or "ExpensesPaidAmt" not in xbrl_json:
-            return pd.DataFrame()
-
-        expensepct = pd.json_normalize(xbrl_json.get("ExpenseRatioPct", {}))
-        expenseamt = pd.json_normalize(xbrl_json.get("ExpensesPaidAmt", {}))
-
-        if "segment.value" in expenseamt.columns:
-            expenseamt["classid"] = expenseamt["segment.value"].apply(extract_classid)
-
-        combined_expenses = pd.merge(expensepct, expenseamt, left_index=True, right_index=True)
-        combined_expenses = combined_expenses.rename(columns={"value_x": "expense_pct", "value_y": "expense_amt"})
-        combined_expenses["filingURL"] = filing_url
-
-        return combined_expenses
-
-    except Exception as e:
-        st.warning(f"⚠️ Error extracting IXBRL data from {filing_url}: {str(e)}")
-        return pd.DataFrame()
-
-def process_filings(sec_filing_urls):
-    """Processes a list of SEC filing URLs by extracting IXBRL data."""
-    results = []
-    progress_bar = st.progress(0)
-    extracted_data_placeholder = st.empty()
-
-    for idx, htm_url in enumerate(sec_filing_urls):
-        extracted_data = extract_ixbrl_data(htm_url)
-        if not extracted_data.empty:
-            results.append(extracted_data)
-            extracted_data_placeholder.dataframe(pd.concat(results, ignore_index=True))
-
-        progress_bar.progress((idx + 1) / len(sec_filing_urls))
-
-    return pd.concat(results, ignore_index=True) if results else pd.DataFrame()
-
 # 🌟 Streamlit UI
 st.set_page_config(page_title="XBRL Expense Extractor", layout="centered")
 
+# **Modern Header**
 st.markdown(
     """
     <h1 style="text-align: center; color: #2E86C1;">📊 XBRL Expense Extractor</h1>
@@ -113,69 +24,120 @@ st.markdown(
     """, unsafe_allow_html=True
 )
 
+# **Bullet Point Description**
 st.markdown(
     """
     ### 🚀 What This Tool Does:
-    - **Option 1**: Upload a CSV file with filing URLs  
-    - **Option 2**: Fetch filings dynamically from SEC using **Form Type & Dates**
-    - Automatically enriches extracted data using an internal class mapping file.
-    - Displays live extracted data while processing.
+    - Extracts **Expense Ratios** and **Expenses Paid** from SEC XBRL filings.
+    - Upload a **CSV file** containing up to **100 URLs** for processing.
+    - Upload a **class mapping CSV** to enrich the extracted data.
+    - Automatically organizes the extracted data in a downloadable CSV file.
+    - Displays extracted results in real-time with progress tracking.
+    
+    ⚠️ **Note:** Please **limit the SEC filings upload to 100 URLs** to ensure smooth processing.
     """
 )
 
-data_input_method = st.radio("Choose Processing Method:", ("Upload CSV File", "Fetch from SEC by Form Type & Date"))
+# **File Uploader Section**
+st.markdown("### 🔄 Upload Your CSV Files")
+uploaded_filing_csv = st.file_uploader(
+    "Upload the SEC Filing URLs CSV (Must contain 'filingURL' column, Max: 100 URLs)",
+    type=["csv"],
+    help="Ensure your CSV has a 'filingURL' column."
+)
 
-uploaded_filing_csv = None
-form_types, from_date, to_date = None, None, None
+uploaded_mapping_csv = st.file_uploader(
+    "Upload the Class Mapping CSV (Must contain 'classid', 'Ticker', 'Class Name', 'Series Name', 'Series ID')",
+    type=["csv"],
+    help="Ensure your CSV has columns: 'classid', 'Ticker', 'Class Name', 'Series Name', 'Series ID'."
+)
 
-if data_input_method == "Upload CSV File":
-    uploaded_filing_csv = st.file_uploader("Upload SEC Filings CSV", type=["csv"])
-elif data_input_method == "Fetch from SEC by Form Type & Date":
-    form_types = st.multiselect("📄 Select Form Type(s)", ["N-CSR", "N-CSRS"])
-    col1, col2 = st.columns(2)
-    with col1:
-        from_date = st.date_input("📅 From Date")
-    with col2:
-        to_date = st.date_input("📅 To Date")
+# Process File if Uploaded
+if uploaded_filing_csv is not None and uploaded_mapping_csv is not None:
+    df_filing = pd.read_csv(uploaded_filing_csv)
+    df_mapping = pd.read_csv(uploaded_mapping_csv)
 
-if st.button("🚀 Submit & Process Data"):
-    if not os.path.exists(CLASS_MAPPING_FILE):
-        st.error(f"❌ Required file '{CLASS_MAPPING_FILE}' is missing!")
+    if "filingURL" not in df_filing.columns:
+        st.error("❌ Error: The SEC Filings CSV must contain a 'filingURL' column.")
+    elif len(df_filing) > 100:
+        st.error(f"❌ Error: File contains {len(df_filing)} URLs. Please limit to **100 URLs max**.")
+    elif not all(col in df_mapping.columns for col in ["classid", "Ticker", "Class Name", "Series Name", "Series ID"]):
+        st.error("❌ Error: The Class Mapping CSV is missing required columns.")
     else:
-        df_mapping = pd.read_csv(CLASS_MAPPING_FILE)
-        required_columns = ["classid", "Ticker", "Class Name", "Series Name", "Series ID"]
+        results = []
+        progress_bar = st.progress(0)
+        total_urls = len(df_filing)
 
-        if not all(col in df_mapping.columns for col in required_columns):
-            st.error(f"❌ '{CLASS_MAPPING_FILE}' is missing required columns.")
+        st.markdown("### ⏳ Processing Filings...")
+        for idx, row in df_filing.iterrows():
+            htm_url = row["filingURL"]
+            st.write(f"🔍 Fetching data from: `{htm_url}`")
+
+            try:
+                # Fetch XBRL data
+                xbrl_json = xbrlApi.xbrl_to_json(htm_url=htm_url)
+                if not xbrl_json:
+                    st.warning(f"⚠️ No data found for `{htm_url}`")
+                    continue
+
+                # Extract expenses
+                expensepct = pd.json_normalize(xbrl_json.get("ExpenseRatioPct", []))
+                expenseamt = pd.json_normalize(xbrl_json.get("ExpensesPaidAmt", []))
+
+                if expensepct.empty or expenseamt.empty:
+                    st.warning(f"⚠️ Skipping `{htm_url}`: No Expense Data Found")
+                    continue
+
+                # Extract class ID
+                expenseamt['classid'] = expenseamt['segment.value'].apply(extract_classid)
+
+                # Merge DataFrames
+                combined_expenses = pd.merge(expensepct, expenseamt, left_index=True, right_index=True)
+                combined_expenses.rename(columns={'value_x': 'expense_pct', 'value_y': 'expense_amt'}, inplace=True)
+                combined_expenses["source_url"] = htm_url
+
+                # Merge with class mapping data
+                combined_expenses = combined_expenses.merge(df_mapping, on="classid", how="left")
+
+                # **Reorder Columns**
+                ordered_columns = [
+                    "classid", "Ticker", "Class Name", "Series Name", "Series ID",
+                    "expense_pct", "expense_amt", "period.startDate_y", "period.endDate_y", "source_url"
+                ]
+                combined_expenses = combined_expenses.reindex(columns=[col for col in ordered_columns if col in combined_expenses.columns])
+
+                # Append to results
+                results.append(combined_expenses)
+
+                # Update progress bar
+                progress_bar.progress((idx + 1) / total_urls)
+
+            except Exception as e:
+                st.warning(f"⚠️ Skipping `{htm_url}` due to error: {e}")
+
+        # Display results
+        if results:
+            final_df = pd.concat(results, ignore_index=True)
+            st.success("✅ Processing Complete! Here's the Extracted Data:")
+            st.dataframe(final_df.style.set_properties(**{'text-align': 'center'}))
+
+            # Convert to CSV for download
+            csv_data = final_df.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "📥 Download Extracted Data",
+                csv_data,
+                "enriched_expenses.csv",
+                "text/csv",
+                key="download-btn"
+            )
         else:
-            if uploaded_filing_csv:
-                df_filing = pd.read_csv(uploaded_filing_csv)
-                if "filingURL" not in df_filing.columns:
-                    st.error("❌ CSV must contain a 'filingURL' column.")
-                elif len(df_filing) > 100:
-                    st.error("❌ File exceeds 100 URLs limit.")
-                else:
-                    sec_filing_urls = df_filing["filingURL"].tolist()
-            elif form_types and from_date and to_date:
-                df_filings = fetch_filings(form_types, from_date, to_date)
-                if df_filings.empty:
-                    st.error("❌ No filings retrieved from SEC.")
-                else:
-                    sec_filing_urls = df_filings["filingURL"].tolist()
-            else:
-                st.error("❌ Select a valid input method.")
+            st.error("❌ No valid data extracted from the provided URLs.")
 
-            extracted_df = process_filings(sec_filing_urls)
-
-            if not extracted_df.empty:
-                extracted_df = extracted_df.merge(df_mapping, on="classid", how="left")
-                extracted_df = extracted_df.reindex(columns=["classid", "Ticker", "Class Name", "Series Name", "Series ID", "expense_pct", "expense_amt", "period.startDate_y", "period.endDate_y", "filingURL"])
-
-                st.success(f"✅ Successfully processed {len(extracted_df)} records!")
-                st.dataframe(extracted_df)
-                csv_data = extracted_df.to_csv(index=False).encode("utf-8")
-                st.download_button("📥 Download Extracted Data", csv_data, "extracted_expenses.csv", "text/csv")
-            else:
-                st.error("❌ No valid data extracted.")
-
-st.markdown("<hr><p style='text-align:center;'>Built with ❤️ using Streamlit | SEC API Integration</p>", unsafe_allow_html=True)
+# **Footer**
+st.markdown(
+    """
+    <hr>
+    <p style="text-align: center; font-size: 14px; color: grey;">
+    </p>
+    """, unsafe_allow_html=True
+)

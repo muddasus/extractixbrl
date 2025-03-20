@@ -74,8 +74,6 @@ def extract_ixbrl_data(filing_url):
 
         expensepct = pd.json_normalize(xbrl_json.get("ExpenseRatioPct", {}))
         expenseamt = pd.json_normalize(xbrl_json.get("ExpensesPaidAmt", {}))
-        AvgAnnualReturnPct = pd.json_normalize(xbrl_json.get("AvgAnnlRtrPct", {}))
-        st.write(xbrl_json.get("AvgAnnlRtrPct", {}))
 
 
         if "segment.value" in expenseamt.columns:
@@ -84,7 +82,7 @@ def extract_ixbrl_data(filing_url):
         combined_expenses = pd.merge(expensepct, expenseamt, left_index=True, right_index=True)
         combined_expenses = combined_expenses.rename(columns={"value_x": "expense_pct", "value_y": "expense_amt"})
         combined_expenses["filingURL"] = filing_url
-        #combined_expenses["AvgAnnualReturnPct"] = AvgAnnualReturnPct
+
 
         return combined_expenses
 

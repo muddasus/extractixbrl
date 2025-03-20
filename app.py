@@ -68,6 +68,8 @@ def extract_ixbrl_data(filing_url):
     """Extracts IXBRL data from a given filing URL."""
     try:
         xbrl_json = xbrlApi.xbrl_to_json(htm_url=filing_url)
+        st.write(xbrl_json)
+        return
         if "ExpenseRatioPct" not in xbrl_json or "ExpensesPaidAmt" not in xbrl_json:
             return pd.DataFrame()
 

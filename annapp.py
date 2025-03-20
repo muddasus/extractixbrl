@@ -3,7 +3,7 @@ import pandas as pd
 from sec_api import QueryApi, XbrlApi
 
 # Your sec-api.io API Key (Replace with your actual key)
-QUERY_API_KEY = "a1293bb279cf316f31123670887b10c1fad2c098a90ff5bae1e3868ab327cf8f"
+API_KEY = "a1293bb279cf316f31123670887b10c1fad2c098a90ff5bae1e3868ab327cf8f"
 
 # Initialize API clients
 queryApi = QueryApi(api_key=API_KEY)

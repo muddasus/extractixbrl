@@ -75,7 +75,7 @@ def extract_ixbrl_data(filing_url):
         expensepct = pd.json_normalize(xbrl_json.get("ExpenseRatioPct", {}))
         expenseamt = pd.json_normalize(xbrl_json.get("ExpensesPaidAmt", {}))
         
-        st.write(xbrl_json.get("AvgAnnlRtrPct", {}))
+        st.write(xbrl_json.get("AddlInfoTextBlock", {}))
 
 
         if "segment.value" in expenseamt.columns:
@@ -103,6 +103,7 @@ def process_filings(sec_filing_urls):
         if not extracted_data.empty:
             results.append(extracted_data)
             extracted_data_placeholder.dataframe(pd.concat(results, ignore_index=True))
+            exit
 
         progress_bar.progress((idx + 1) / len(sec_filing_urls))
 

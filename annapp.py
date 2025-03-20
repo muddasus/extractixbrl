@@ -27,9 +27,10 @@ def get_filing_cik(cik):
 # Function to extract Avg Annual Return from XBRL
 def fetch_avg_annual_return(cik):
     filing_id = get_filing_cik(cik)
+    st.write(f"🔍 Fetching filing_id ")
     if not filing_id:
         return None
-
+    st.write(f"🔍 Fetched filing for CIK: {filing_id}")
     xbrl_data = xbrlApi.xbrl(filing_id)
     
     results = []

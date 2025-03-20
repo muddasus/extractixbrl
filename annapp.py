@@ -31,7 +31,7 @@ def fetch_avg_annual_return(cik):
     if not filing_id:
         return None
     st.write(f"🔍 Fetched filing for CIK: {filing_id}")
-    xbrl_data = xbrlApi.xbrl(filing_id)
+    xbrl_data = xbrlApi.get_xbrl(filing_id)
     
     results = []
     for key, item in xbrl_data["facts"].items():

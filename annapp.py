@@ -12,7 +12,7 @@ xbrlApi = XbrlApi(api_key=API_KEY)
 # Function to get the latest filing with Avg Annual Return (oef:AvgAnnlRtrPct)
 def get_filing_cik(cik):
     query = {
-        "query": f"formType:(N-CSR OR N-CSRS) AND cik:{cik}",
+        "query": f"formType:(N-CSR OR N-CSRS OR N-CSR/A) AND cik:{cik}",
         "from": "0",
         "size": "1",
         "sort": [{"filedAt": {"order": "desc"}}]

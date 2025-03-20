@@ -14,12 +14,12 @@ def get_filing_cik(cik):
     query = {
         "query": f"formType:(N-CSR OR N-CSRS OR N-CSR/A) AND cik:{cik}",
         "from": "0",
-        "size": "1",
+        "size": "50",
         "sort": [{"filedAt": {"order": "desc"}}]
     }
     
     response = queryApi.get_filings(query)
-    
+    st.write(f"🔍 Fetched response for CIK: {response}")
     if response.get("filings"):
         return response["filings"][0]["id"]
     return None

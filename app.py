@@ -75,7 +75,7 @@ def extract_ixbrl_data(filing_url):
         expensepct = pd.json_normalize(xbrl_json.get("ExpenseRatioPct", {}))
         expenseamt = pd.json_normalize(xbrl_json.get("ExpensesPaidAmt", {}))
         AvgAnnualReturnPct = pd.json_normalize(xbrl_json.get("AvgAnnlRtrPct", {}))
-        st.write(AvgAnnualReturnPct)
+        st.write(xbrl_json.get("AvgAnnlRtrPct", {}))
 
 
         if "segment.value" in expenseamt.columns:

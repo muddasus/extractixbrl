@@ -1,4 +1,4 @@
-# app_terms_only.py (robust v2)
+# app_terms_only.py
 import re
 import io
 import csv
@@ -21,21 +21,23 @@ MAJOR_HEADING_HINTS = (
     "risks", "taxes", "conflicts of interest", "appendix", "buying the contract",
 )
 
-# Safe dash characters for parsing "Term — Definition" lines
-#   \u2014 = em dash (—), \u2013 = en dash (–), \u2212 = minus (−), \u2010 = hyphen (‐), \u2011 = non-breaking hyphen (-)
-DASH_CHARS = "\u2014\u2013\u2212\u2010\u2011"  # do not include ASCII '-' here
-DASH_CLASS = f"[{DASH_CHARS}:-]"  # put ASCII '-' at the END of the class to avoid ranges
+# Safe dash characters for "Term — Definition" lines
+# \u2014 em dash, \u2013 en dash, \u2212 minus, \u2010 hyphen, \u2011 non-breaking hyphen
+DASH_CHARS = "\u2014\u2013\u2212\u2010\u2011"
+DASH_CLASS = f"[{DASH_CHARS}:-]"  # ASCII '-' at the end to avoid ranges
 
 # --- HTTP fetch with SEC-friendly UA ---
 def fetch_html(source: str, user_agent: str) -> str:
     parsed = urlparse(source)
     if parsed.scheme not in ("http", "https"):
-        return source  # treat as raw HTML
+        return source  # treat as raw HTML text
 
     s = requests.Session()
-    retries = Retry(total=3, backoff_factor=0.5,
-                    status_forcelist=[429, 500, 502, 503, 504],
-                    allowed_methods=["GET", "HEAD", "OPTIONS"])
+    retries = Retry(
+        total=3, backoff_factor=0.5,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET", "HEAD", "OPTIONS"]
+    )
     s.mount("https://", HTTPAdapter(max_retries=retries))
     s.mount("http://", HTTPAdapter(max_retries=retries))
 
@@ -59,7 +61,7 @@ def fetch_html(source: str, user_agent: str) -> str:
     r.encoding = r.encoding or r.apparent_encoding
     return r.text
 
-# --- Small helpers ---
+# --- Helpers ---
 def norm_text(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "")).strip().rstrip(":").lower()
 
@@ -98,7 +100,7 @@ def find_pseudo_heading(soup: BeautifulSoup, labels: list[str]) -> list[Tag]:
         if not txt or len(txt) > 160: continue
         if norm_text(txt) in labels_norm:
             hits.append(tag)
-    # TOC anchors
+    # TOC anchors → follow to target id/name
     for a in soup.find_all("a"):
         if norm_text(a.get_text(strip=True)) in labels_norm:
             href = (a.get("href") or "")
@@ -165,7 +167,7 @@ def parse_dl_term_defs(container: Tag) -> list[dict]:
     for dl in container.find_all("dl"):
         dts = dl.find_all("dt")
         dds = dl.find_all("dd")
-        for dt, dd in zip(dts, dds):  # zip keeps us safe if counts differ
+        for dt, dd in zip(dts, dds):  # zip keeps safe when counts differ
             term = (dt.get_text(" ", strip=True) or "").strip(f" .:;{DASH_CHARS}-")
             definition = (dd.get_text(" ", strip=True) or "").strip()
             if 2 <= len(term) <= 200 and len(definition) >= 5:
@@ -174,7 +176,7 @@ def parse_dl_term_defs(container: Tag) -> list[dict]:
 
 def parse_inline_defs(lines: list[str]) -> list[dict]:
     out = []
-    # Accept em/en/minus/non-breaking/ASCII hyphen or colon as separators
+    # accept em/en/minus/nb-hyphen/ASCII '-' or colon
     pattern = re.compile(rf"^(.+?)(?:\s*{DASH_CLASS}\s*)(.+)$")
     for line in lines:
         m = pattern.match(line)
@@ -194,7 +196,7 @@ def extract_special_terms(raw_html: str, headings: list[str]) -> list[dict]:
         nodes = nodes_until_next_heading(start)
         if not nodes:
             continue
-        # Build one HTML string and parse once (avoids cross-soup insertion issues)
+        # Build one HTML string and parse once (avoid cross-soup insertion)
         section_html = "".join(str(n) for n in nodes if n is not None)
         if not section_html.strip():
             continue
@@ -285,7 +287,6 @@ if raw_html:
             file_name="special_terms.json",
             mime="application/json"
         )
-
     else:
         st.warning("No Special Terms detected. Try adding more heading aliases (e.g., 'SPECIAL TERMS', 'GLOSSARY').")
 

@@ -3,6 +3,8 @@ import re
 import io
 import streamlit as st
 from bs4 import BeautifulSoup, NavigableString, Tag
+import requests
+from requests.adapters import HTTPAdapter, Retry
 from collections import OrderedDict
 from urllib.parse import urlparse
 from urllib.request import urlopen, Request
@@ -33,7 +35,7 @@ EXCLUSION_PATTERNS = [
 # ------------------------------
 # Utility
 # ------------------------------
-def fetch_html(source: str) -> str:
+def fetch_html1(source: str) -> str:
     parsed = urlparse(source)
     if parsed.scheme in ("http", "https"):
         req = Request(source, headers={"User-Agent": "Mozilla/5.0"})
@@ -41,6 +43,46 @@ def fetch_html(source: str) -> str:
             return r.read().decode("utf-8", errors="ignore")
     return source  # when we pass raw HTML text
 
+def fetch_html(source: str, user_agent: str) -> str:
+    # If the input is raw HTML (no scheme), just return it
+    parsed = urlparse(source)
+    if parsed.scheme not in ("http", "https"):
+        return source
+
+    # Requests session with retries and backoff
+    s = requests.Session()
+    retries = Retry(
+        total=3,
+        backoff_factor=0.5,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET", "HEAD", "OPTIONS"]
+    )
+    s.mount("https://", HTTPAdapter(max_retries=retries))
+    s.mount("http://", HTTPAdapter(max_retries=retries))
+
+    headers = {
+        # SEC asks for a UA with contact info; include your email/domain
+        "User-Agent": user_agent or "MyCompany MyApp/1.0 (my.email@example.com)",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.7",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
+
+    resp = s.get(source, headers=headers, timeout=20)
+    if resp.status_code == 403:
+        # helpful message for Streamlit UI
+        raise RuntimeError(
+            "SEC returned 403 Forbidden. Use a descriptive User-Agent with contact info "
+            "in the sidebar, or download the HTML and use 'Upload HTML'."
+        )
+    resp.raise_for_status()
+    # requests handles gzip/br automatically; use text with apparent encoding
+    resp.encoding = resp.encoding or resp.apparent_encoding
+    return resp.text
+    
 def looks_like_toc_or_nav(el: Tag) -> bool:
     role = (el.get("role") or "").lower()
     if any(h in role for h in NAV_ROLE_HINTS):
@@ -324,7 +366,7 @@ if run_btn:
             if not url_val:
                 st.error("Please provide a URL.")
             else:
-                raw_html = fetch_html(url_val)
+                raw_html = fetch_html(url_val, user_agent=user_agent)
         else:
             if not html_upload:
                 st.error("Please upload an HTML file.")

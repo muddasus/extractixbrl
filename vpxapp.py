@@ -57,6 +57,7 @@ def fetch_html(source: str, user_agent: str) -> str:
         )
     r.raise_for_status()
     r.encoding = r.encoding or r.apparent_encoding
+    st.info(r.text)
     return r.text
 
 # --- Helpers ---

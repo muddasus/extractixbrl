@@ -1,4 +1,4 @@
-# app_terms_only.py
+# app_terms_only.py (fixed)
 import re
 import streamlit as st
 from bs4 import BeautifulSoup, Tag
@@ -142,11 +142,12 @@ def parse_table_term_defs(container: Tag) -> list[dict]:
     for table in container.find_all("table"):
         for tr in table.find_all("tr"):
             tds = tr.find_all(["td","th"])
-            if len(tds) < 2: continue
+            if len(tds) < 2:
+                continue
             left = tds[0].get_text(" ", strip=True)
             right = " ".join(td.get_text(" ", strip=True) for td in tds[1:])
-            term = left.strip(" .:;—–-")
-            definition = right.strip()
+            term = (left or "").strip(" .:;—–-")
+            definition = (right or "").strip()
             if 2 <= len(term) <= 120 and len(definition) >= 5:
                 out.append({"term": term, "definition": definition})
     return out
@@ -156,9 +157,9 @@ def parse_dl_term_defs(container: Tag) -> list[dict]:
     for dl in container.find_all("dl"):
         dts = dl.find_all("dt")
         dds = dl.find_all("dd")
-        for dt, dd in zip(dts, dds):
-            term = dt.get_text(" ", strip=True).strip(" .:;—–-")
-            definition = dd.get_text(" ", strip=True)
+        for dt, dd in zip(dts, dds):  # zip keeps us safe if counts differ
+            term = (dt.get_text(" ", strip=True) or "").strip(" .:;—–-")
+            definition = (dd.get_text(" ", strip=True) or "").strip()
             if 2 <= len(term) <= 120 and len(definition) >= 5:
                 out.append({"term": term, "definition": definition})
     return out
@@ -168,7 +169,8 @@ def parse_inline_defs(lines: list[str]) -> list[dict]:
     # accept em dash, en dash, hyphen, or colon
     for line in lines:
         m = re.match(r"^(.+?)(?:\s*[—–-:]\s*)(.+)$", line)
-        if not m: continue
+        if not m: 
+            continue
         term = m.group(1).strip().rstrip(".:;")
         definition = m.group(2).strip()
         if 2 <= len(term) <= 120 and len(definition) >= 5:
@@ -181,10 +183,16 @@ def extract_special_terms(raw_html: str, headings: list[str]) -> list[dict]:
     results = []
     for start in starts:
         nodes = nodes_until_next_heading(start)
-        if not nodes: continue
-        tmp = BeautifulSoup("<div></div>", "lxml").div
-        for n in nodes:
-            if n: tmp.append(BeautifulSoup(str(n), "lxml"))
+        if not nodes:
+            continue
+        # *** FIX: build one HTML string and parse once (no per-node append of BS objects) ***
+        section_html = "".join(str(n) for n in nodes if n is not None)
+        if not section_html.strip():
+            continue
+        tmp_soup = BeautifulSoup(f"<div id='tmp'>{section_html}</div>", "lxml")
+        tmp = tmp_soup.find(id="tmp")
+
+        # Try multiple formats
         results.extend(parse_table_term_defs(tmp))
         results.extend(parse_dl_term_defs(tmp))
         results.extend(parse_inline_defs(clean_lines_from_nodes(nodes)))
@@ -207,6 +215,8 @@ with st.sidebar:
     user_agent = st.text_input("HTTP User-Agent (required for SEC URLs)", value=ua_default)
     mode = st.radio("Mode", ["URL", "Upload HTML"], horizontal=True)
 
+    url_val = None
+    html_file = None
     if mode == "URL":
         url_val = st.text_input("SEC filing URL", placeholder="https://www.sec.gov/Archives/...")
         run_btn = st.button("Extract terms")
@@ -256,15 +266,8 @@ if raw_html:
             file_name="special_terms.csv",
             mime="text/csv"
         )
-        st.download_button(
-            "Download terms (JSON)",
-            data=str(terms).encode("utf-8"),
-            file_name="special_terms.json",
-            mime="application/json"
-        )
     else:
-        st.error("No Special Terms detected. Try adding more heading aliases (e.g., 'SPECIAL TERMS', 'GLOSSARY').")
+        st.warning("No Special Terms detected. Try adding more heading aliases (e.g., 'SPECIAL TERMS', 'GLOSSARY').")
 
 else:
     st.info("Enter a URL or upload an HTML file, then click **Extract terms**.")
-

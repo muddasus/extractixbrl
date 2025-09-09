@@ -1,5 +1,8 @@
-# app_terms_only.py (fixed)
+# app_terms_only.py (robust v2)
 import re
+import io
+import csv
+import json
 import streamlit as st
 from bs4 import BeautifulSoup, Tag
 from collections import OrderedDict
@@ -17,6 +20,11 @@ MAJOR_HEADING_HINTS = (
     "important information", "overview", "benefits available", "fee tables",
     "risks", "taxes", "conflicts of interest", "appendix", "buying the contract",
 )
+
+# Safe dash characters for parsing "Term — Definition" lines
+#   \u2014 = em dash (—), \u2013 = en dash (–), \u2212 = minus (−), \u2010 = hyphen (‐), \u2011 = non-breaking hyphen (-)
+DASH_CHARS = "\u2014\u2013\u2212\u2010\u2011"  # do not include ASCII '-' here
+DASH_CLASS = f"[{DASH_CHARS}:-]"  # put ASCII '-' at the END of the class to avoid ranges
 
 # --- HTTP fetch with SEC-friendly UA ---
 def fetch_html(source: str, user_agent: str) -> str:
@@ -146,9 +154,9 @@ def parse_table_term_defs(container: Tag) -> list[dict]:
                 continue
             left = tds[0].get_text(" ", strip=True)
             right = " ".join(td.get_text(" ", strip=True) for td in tds[1:])
-            term = (left or "").strip(" .:;—–-")
+            term = (left or "").strip(f" .:;{DASH_CHARS}-")
             definition = (right or "").strip()
-            if 2 <= len(term) <= 120 and len(definition) >= 5:
+            if 2 <= len(term) <= 200 and len(definition) >= 5:
                 out.append({"term": term, "definition": definition})
     return out
 
@@ -158,22 +166,23 @@ def parse_dl_term_defs(container: Tag) -> list[dict]:
         dts = dl.find_all("dt")
         dds = dl.find_all("dd")
         for dt, dd in zip(dts, dds):  # zip keeps us safe if counts differ
-            term = (dt.get_text(" ", strip=True) or "").strip(" .:;—–-")
+            term = (dt.get_text(" ", strip=True) or "").strip(f" .:;{DASH_CHARS}-")
             definition = (dd.get_text(" ", strip=True) or "").strip()
-            if 2 <= len(term) <= 120 and len(definition) >= 5:
+            if 2 <= len(term) <= 200 and len(definition) >= 5:
                 out.append({"term": term, "definition": definition})
     return out
 
 def parse_inline_defs(lines: list[str]) -> list[dict]:
     out = []
-    # accept em dash, en dash, hyphen, or colon
+    # Accept em/en/minus/non-breaking/ASCII hyphen or colon as separators
+    pattern = re.compile(rf"^(.+?)(?:\s*{DASH_CLASS}\s*)(.+)$")
     for line in lines:
-        m = re.match(r"^(.+?)(?:\s*[—–-:]\s*)(.+)$", line)
-        if not m: 
+        m = pattern.match(line)
+        if not m:
             continue
         term = m.group(1).strip().rstrip(".:;")
         definition = m.group(2).strip()
-        if 2 <= len(term) <= 120 and len(definition) >= 5:
+        if 2 <= len(term) <= 200 and len(definition) >= 5:
             out.append({"term": term, "definition": definition})
     return out
 
@@ -185,7 +194,7 @@ def extract_special_terms(raw_html: str, headings: list[str]) -> list[dict]:
         nodes = nodes_until_next_heading(start)
         if not nodes:
             continue
-        # *** FIX: build one HTML string and parse once (no per-node append of BS objects) ***
+        # Build one HTML string and parse once (avoids cross-soup insertion issues)
         section_html = "".join(str(n) for n in nodes if n is not None)
         if not section_html.strip():
             continue
@@ -215,8 +224,6 @@ with st.sidebar:
     user_agent = st.text_input("HTTP User-Agent (required for SEC URLs)", value=ua_default)
     mode = st.radio("Mode", ["URL", "Upload HTML"], horizontal=True)
 
-    url_val = None
-    html_file = None
     if mode == "URL":
         url_val = st.text_input("SEC filing URL", placeholder="https://www.sec.gov/Archives/...")
         run_btn = st.button("Extract terms")
@@ -257,15 +264,28 @@ if raw_html:
         st.success(f"Found {len(terms)} terms.")
         st.dataframe([{"term": t["term"], "definition": t["definition"]} for t in terms],
                      use_container_width=True)
+
+        # CSV (safe quoting)
+        csv_buf = io.StringIO()
+        writer = csv.writer(csv_buf)
+        writer.writerow(["term", "definition"])
+        for t in terms:
+            writer.writerow([t["term"], t["definition"]])
         st.download_button(
             "Download terms (CSV)",
-            data=("term,definition\n" + "\n".join(
-                f"\"{t['term'].replace('\"','\"\"')}\",\"{t['definition'].replace('\"','\"\"')}\""
-                for t in terms
-            )).encode("utf-8"),
+            data=csv_buf.getvalue().encode("utf-8"),
             file_name="special_terms.csv",
             mime="text/csv"
         )
+
+        # JSON
+        st.download_button(
+            "Download terms (JSON)",
+            data=json.dumps(terms, ensure_ascii=False, indent=2).encode("utf-8"),
+            file_name="special_terms.json",
+            mime="application/json"
+        )
+
     else:
         st.warning("No Special Terms detected. Try adding more heading aliases (e.g., 'SPECIAL TERMS', 'GLOSSARY').")
 

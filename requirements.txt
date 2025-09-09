@@ -1,5 +1,6 @@
 streamlit
 beautifulsoup4
 lxml
+requests
 pandas
 sec-api

@@ -69,7 +69,7 @@ DASH_CLASS = f"[{DASH_CHARS}:-]"
 
 # term line matchers
 DASH_RE  = re.compile(rf"^\s*(.+?)\s*{DASH_CLASS}\s*(.+?)\s*$")
-COLON_RE = re.compile(rr"^\s*(.+?)\s*:\s*(.+?)\s*$")
+COLON_RE = re.compile(r"^\s*(.+?)\s*:\s*(.+?)\s*$")
 
 # For the “Term. Definition” style, keep it strict enough to avoid ordinary sentences.
 # Heuristics: term starts with a letter/number, <= 8 words, may include ()&/'- characters, ends with a dot, followed by a space.

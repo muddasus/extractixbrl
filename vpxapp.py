@@ -1,4 +1,4 @@
-# app_terms_only.py — Anchorless Special Terms extractor (robust “longest-run” approach)
+# app_terms_only.py — Anchorless Special Terms / Glossary extractor (dash/colon/dot styles)
 import re
 import io
 import csv
@@ -15,16 +15,12 @@ def fetch_html(source: str, user_agent: str) -> str:
     parsed = urlparse(source)
     if parsed.scheme not in ("http", "https"):
         return source  # treat as raw HTML
-
     s = requests.Session()
-    retries = Retry(
-        total=3, backoff_factor=0.5,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET", "HEAD", "OPTIONS"],
-    )
+    retries = Retry(total=3, backoff_factor=0.5,
+                    status_forcelist=[429, 500, 502, 503, 504],
+                    allowed_methods=["GET", "HEAD", "OPTIONS"])
     s.mount("https://", HTTPAdapter(max_retries=retries))
     s.mount("http://", HTTPAdapter(max_retries=retries))
-
     headers = {
         "User-Agent": user_agent or "YourOrg YourApp/1.0 (name@example.com)",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -48,25 +44,17 @@ def html_to_text_with_breaks(html: str) -> str:
     """Convert body HTML to plain text with hard breaks at p/br/li/tr/td/th/dt/dd."""
     soup = BeautifulSoup(html, "lxml")
     root = soup.body or soup
-
     breakers = {"p","div","li","br","tr","td","th","dd","dt"}
     parts = []
-
     def walk(el):
         if isinstance(el, NavigableString):
             s = str(el)
-            if s:
-                parts.append(s)
+            if s: parts.append(s)
             return
-        if not isinstance(el, Tag):
-            return
-        if el.name in {"script","style"}:
-            return
-        for c in el.children:
-            walk(c)
-        if el.name in breakers:
-            parts.append("\n")
-
+        if not isinstance(el, Tag): return
+        if el.name in {"script","style"}: return
+        for c in el.children: walk(c)
+        if el.name in breakers: parts.append("\n")
     walk(root)
     txt = "".join(parts)
     txt = re.sub(r"\r", "", txt)
@@ -76,18 +64,43 @@ def html_to_text_with_breaks(html: str) -> str:
 
 # ---------------- Parsing ----------------
 # Unicode dashes: em (—), en (–), minus (−), hyphen (‐), nb-hyphen (-). Place ASCII '-' at end.
-DASH_CHARS = "\u2014\u2013\u2212\u2010\u2011\u2012\u2013"
+DASH_CHARS = "\u2014\u2013\u2212\u2010\u2011\u2012"
 DASH_CLASS = f"[{DASH_CHARS}:-]"
 
-# A single line that clearly looks like "Term — Definition"
-TERM_LINE_RE = re.compile(rf"^\s*(.+?)\s*(?:{DASH_CLASS})\s*(.+?)\s*$")
+# term line matchers
+DASH_RE  = re.compile(rf"^\s*(.+?)\s*{DASH_CLASS}\s*(.+?)\s*$")
+COLON_RE = re.compile(rr"^\s*(.+?)\s*:\s*(.+?)\s*$")
+
+# For the “Term. Definition” style, keep it strict enough to avoid ordinary sentences.
+# Heuristics: term starts with a letter/number, <= 8 words, may include ()&/'- characters, ends with a dot, followed by a space.
+DOT_RE   = re.compile(
+    r"^\s*([A-Za-z0-9][A-Za-z0-9()&'\/\-\s]{0,120}?)\.\s+(.*)$"
+)
+
+def try_match_term_line(line: str):
+    """Return (term, definition) if the line is a term-definition start; else None."""
+    m = DASH_RE.match(line)
+    if m:
+        return m.group(1).strip().rstrip(".:;"), m.group(2).strip()
+    m = COLON_RE.match(line)
+    if m:
+        return m.group(1).strip().rstrip(".:;"), m.group(2).strip()
+    m = DOT_RE.match(line)
+    if m:
+        # Guard against false positives: require term not too long (<= 8 words) OR contains capitalized words
+        term = m.group(1).strip()
+        defn = m.group(2).strip()
+        words = term.split()
+        cap_words = sum(1 for w in words if w[:1].isupper())
+        if len(words) <= 8 or cap_words >= max(2, len(words)//2):
+            return term, defn
+    return None
 
 def parse_accumulated(lines):
-    """Stateful parser: new term starts on TERM_LINE_RE; following lines join the definition until next term."""
+    """Stateful parser: new term starts on a recognized line; following lines join definition until next term."""
     items = []
     cur_term = None
     cur_def = []
-
     def flush():
         nonlocal cur_term, cur_def
         if cur_term:
@@ -95,43 +108,36 @@ def parse_accumulated(lines):
             if 2 <= len(cur_term) <= 300 and len(definition) >= 5:
                 items.append({"term": cur_term, "definition": definition})
         cur_term, cur_def = None, []
-
     for line in lines:
         if line in {"* * *", "***"}:
-            # hard section break
             flush()
-            if items:
-                break
-            else:
-                continue
-        m = TERM_LINE_RE.match(line)
-        if m:
+            if items: break
+            else: continue
+        md = try_match_term_line(line)
+        if md:
             flush()
-            cur_term = m.group(1).strip().rstrip(".:;")
-            cur_def = [m.group(2).strip()]
+            cur_term = md[0]
+            cur_def = [md[1]]
         else:
             if cur_term:
                 cur_def.append(line)
             else:
-                # ignore prose until first term line
                 continue
     flush()
     return items
 
-def longest_term_run(all_lines, min_terms_in_run=4, max_gap=1):
+def longest_term_run(all_lines, min_terms_in_run=4, max_gap=2):
     """
-    Find the longest contiguous run that yields term pairs.
-    We allow up to 'max_gap' non-matching lines between term lines (for wrapped definitions).
+    Find the longest contiguous run that yields term/definition pairs.
+    Allow up to 'max_gap' non-matching lines between term lines (for wrapped definitions).
     """
-    best = (0, 0, [])  # (start_idx, end_idx_exclusive, parsed_items)
+    best = (0, 0, [])
     n = len(all_lines)
     i = 0
     while i < n:
-        # Skip until we see a plausible term line
-        if not TERM_LINE_RE.match(all_lines[i]):
+        if not try_match_term_line(all_lines[i]):
             i += 1
             continue
-        # Grow a window
         start = i
         j = i
         gaps = 0
@@ -139,62 +145,55 @@ def longest_term_run(all_lines, min_terms_in_run=4, max_gap=1):
         while j < n:
             ln = all_lines[j]
             window_lines.append(ln)
-            if TERM_LINE_RE.match(ln):
+            if try_match_term_line(ln):
                 gaps = 0
             else:
                 gaps += 1
                 if gaps > max_gap:
-                    # end the window just before this excessive gap
-                    window_lines.pop()  # remove the line that broke the gap rule
+                    window_lines.pop()
                     break
             j += 1
         parsed = parse_accumulated(window_lines)
         if len(parsed) >= min_terms_in_run and len(parsed) > len(best[2]):
             best = (start, start + len(window_lines), parsed)
         i = max(j, i + 1)
-    return best  # may be (0,0,[]) if nothing found
+    return best
 
 def extract_special_terms_anchorless(raw_html: str):
     """
-    Anchorless extraction:
     1) Convert entire body to text with line breaks.
-    2) Locate the longest run that parses into term/definition pairs.
-    3) Return parsed items and a debug text slice.
+    2) Locate longest run of recognizable term lines (dash/colon/dot).
+    3) Parse with accumulation; dedupe terms (favor longest definitions).
     """
     text = html_to_text_with_breaks(raw_html)
     if not text:
         return [], ""
-
     lines = [l.strip() for l in text.splitlines() if l.strip()]
-    start, end, items = longest_term_run(lines, min_terms_in_run=4, max_gap=2)
-
-    # If nothing met the min threshold, try a very lenient pass (still safe).
+    start, end, items = longest_term_run(lines, min_terms_in_run=4, max_gap=3)
     if not items:
-        start, end, items = longest_term_run(lines, min_terms_in_run=2, max_gap=3)
-
+        # Very lenient fallback
+        start, end, items = longest_term_run(lines, min_terms_in_run=2, max_gap=5)
     debug_slice = "\n".join(lines[start:end]) if end > start else ""
-    # Deduplicate by lowercase term, prefer the longest definition
+    # Dedup
     dedup = OrderedDict()
     for it in items:
         t = it["term"].strip()
         d = it["definition"].strip()
-        if not t or not d:
-            continue
+        if not t or not d: continue
         k = t.lower()
         if (k not in dedup) or (len(d) > len(dedup[k]["definition"])):
             dedup[k] = {"term": t, "definition": d}
     return list(dedup.values()), debug_slice
 
 # ---------------- Streamlit UI ----------------
-st.set_page_config(page_title="EDGAR Special Terms (Anchorless Extractor)", layout="wide")
-st.title("EDGAR — Extract Special Terms & Definitions (Anchorless)")
+st.set_page_config(page_title="EDGAR Special Terms / Glossary Extractor", layout="wide")
+st.title("EDGAR — Extract Special Terms & Definitions (Anchorless, multi-style)")
 
 with st.sidebar:
     st.header("Input")
     ua_default = "YourOrg YourApp/1.0 (name@example.com)"
     user_agent = st.text_input("HTTP User-Agent (required for SEC URLs)", value=ua_default)
     mode = st.radio("Mode", ["URL", "Upload HTML"], horizontal=True)
-
     if mode == "URL":
         url_val = st.text_input("SEC filing URL", placeholder="https://www.sec.gov/Archives/...")
         run_btn = st.button("Extract terms")
@@ -219,7 +218,7 @@ if run_btn:
         st.error(f"Failed to load HTML: {e}")
 
 if raw_html:
-    with st.spinner("Finding the Special Terms block…"):
+    with st.spinner("Finding the Special Terms / Glossary block…"):
         terms, debug_text = extract_special_terms_anchorless(raw_html)
 
     st.subheader("Results")
@@ -227,7 +226,6 @@ if raw_html:
         st.success(f"Found {len(terms)} terms.")
         st.dataframe([{"term": t["term"], "definition": t["definition"]} for t in terms],
                      use_container_width=True)
-
         # CSV
         csv_buf = io.StringIO()
         writer = csv.writer(csv_buf)
@@ -238,18 +236,16 @@ if raw_html:
                            data=csv_buf.getvalue().encode("utf-8"),
                            file_name="special_terms.csv",
                            mime="text/csv")
-
         # JSON
         st.download_button("Download terms (JSON)",
                            data=json.dumps(terms, ensure_ascii=False, indent=2).encode("utf-8"),
                            file_name="special_terms.json",
                            mime="application/json")
     else:
-        st.error("No Special Terms block detected. See the debug slice below.")
-
-    st.markdown("#### Debug: Detected Special Terms block (text)")
+        st.error("No Special Terms / Glossary block detected. See the debug slice below.")
+    st.markdown("#### Debug: Detected block (text)")
     if debug_text:
-        st.code(debug_text[:6000], language="text")
+        st.code(debug_text[:8000], language="text")
     else:
         st.caption("No contiguous run of term/definition lines found.")
 else:

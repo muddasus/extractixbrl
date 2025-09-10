@@ -1,4 +1,4 @@
-# app_terms_only.py — SEC "Special Terms" extractor (matches how results were generated)
+# app_terms_only.py — SEC "Special Terms" extractor (robust & tested)
 import re
 import io
 import csv
@@ -17,17 +17,15 @@ SKIP_TAGS = {"script","style"}
 NAV_ROLE_HINTS = ("navigation", "doc-index", "doc-toc")
 TOC_CLASS_HINTS = ("toc", "table of contents")
 
-# Section/heading cues common in these filings
 MAJOR_HEADING_HINTS = (
     "important information", "overview of the contract", "benefits available",
     "buying the contract", "making withdrawals", "additional information about fees",
     "fee tables", "risks", "taxes", "conflicts of interest", "appendix", "table of contents",
 )
 
-# Unicode dashes used in these filings
-# em (— \u2014), en (– \u2013), minus (− \u2212), hyphen (‐ \u2010), nb-hyphen (- \u2011)
+# Unicode dashes: em (—), en (–), minus (−), hyphen (‐), non-breaking hyphen (-).
 DASH_CHARS = "\u2014\u2013\u2212\u2010\u2011"
-DASH_CLASS = f"[{DASH_CHARS}:-]"  # ASCII '-' and ':' included; '-' placed at end to avoid range
+DASH_CLASS = f"[{DASH_CHARS}:-]"  # ASCII '-' placed at end to avoid regex range
 
 # ---------------- HTTP (SEC-friendly) ----------------
 def fetch_html(source: str, user_agent: str) -> str:
@@ -36,29 +34,24 @@ def fetch_html(source: str, user_agent: str) -> str:
         return source  # treat as raw HTML
 
     s = requests.Session()
-    retries = Retry(
-        total=3, backoff_factor=0.5,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET", "HEAD", "OPTIONS"],
-    )
+    retries = Retry(total=3, backoff_factor=0.5,
+                    status_forcelist=[429, 500, 502, 503, 504],
+                    allowed_methods=["GET", "HEAD", "OPTIONS"])
     s.mount("https://", HTTPAdapter(max_retries=retries))
     s.mount("http://", HTTPAdapter(max_retries=retries))
 
     headers = {
-        "User-Agent": user_agent or "YourOrg YourApp/1.0 (you@yourorg.com)",
+        "User-Agent": user_agent or "YourOrg YourApp/1.0 (name@example.com)",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.7",
-        "Accept-Encoding": "gzip, deflate, br",
         "Cache-Control": "no-cache",
         "Pragma": "no-cache",
         "Connection": "keep-alive",
     }
     r = s.get(source, headers=headers, timeout=25)
     if r.status_code == 403:
-        raise RuntimeError(
-            "SEC returned 403 Forbidden. Provide a descriptive User-Agent with contact info, "
-            "or download the HTML and use 'Upload HTML'."
-        )
+        raise RuntimeError("SEC returned 403 (Forbidden). Use a descriptive User-Agent with contact info, "
+                           "or download the HTML and use 'Upload HTML'.")
     r.raise_for_status()
     r.encoding = r.encoding or r.apparent_encoding
     return r.text
@@ -80,7 +73,6 @@ def is_heading_like(tag: Tag) -> bool:
     txt = (tag.get_text(" ", strip=True) or "")
     tnorm = norm_text(txt)
     if len(tnorm) < 3: return False
-    # treat short bold/centered/all-caps blocks as headings
     if (tag.find(["b","strong"]) or tag.name in {"center"}) and len(txt) <= 200:
         return True
     if any(h in tnorm for h in MAJOR_HEADING_HINTS):
@@ -89,31 +81,8 @@ def is_heading_like(tag: Tag) -> bool:
         return True
     return False
 
-def find_special_terms_anchor(soup: BeautifulSoup, headings: list[str]) -> Tag | None:
-    # 1) exact text node "Special Terms"
-    for node in soup.find_all(string=re.compile(r"^\s*Special\s+Terms\s*$", re.I)):
-        if isinstance(node, NavigableString) and isinstance(node.parent, Tag):
-            return node.parent
-    # 2) any element whose own text is exactly "Special Terms"
-    labels_norm = set(norm_text(x) for x in headings) | {"special terms"}
-    for tag in soup.find_all(True):
-        if tag.name in SKIP_TAGS:
-            continue
-        if norm_text(tag.get_text(" ", strip=True)) in labels_norm:
-            return tag
-    # 3) TOC anchors <a href="#something">Special Terms</a>
-    for a in soup.find_all("a"):
-        if norm_text(a.get_text(strip=True)) == "special terms":
-            href = (a.get("href") or "")
-            if href.startswith("#"):
-                ident = href[1:]
-                target = soup.find(id=ident) or soup.find(attrs={"name": ident})
-                if target:
-                    return target
-    return None
-
 def nodes_until_next_heading(start: Tag) -> list:
-    """Collect next siblings after 'start' until a heading-like block or separator."""
+    """Collect next siblings after 'start' until heading-like block or separators."""
     nodes = []
     if not isinstance(start, Tag): return nodes
     cur = start.next_sibling
@@ -123,7 +92,6 @@ def nodes_until_next_heading(start: Tag) -> list:
                 break
             if cur.name == "hr":
                 break
-        # break on common ornamental separators
         text = cur.get_text(" ", strip=True) if isinstance(cur, Tag) else str(cur).strip()
         if text in {"* * *", "***"}:
             break
@@ -132,42 +100,68 @@ def nodes_until_next_heading(start: Tag) -> list:
     return nodes
 
 def html_slice_to_text_with_breaks(nodes: list) -> str:
-    """Convert a node slice to plain text with *hard* line breaks at p/br/li/td/th."""
-    # Build a temporary soup, then walk and insert newlines
+    """Turn a node slice into text with hard breaks at p/br/li/td/th/tr/dt/dd."""
     section_html = "".join(str(n) for n in nodes if n is not None)
     tmp = BeautifulSoup(section_html, "lxml")
 
-    # For tags that should force a break
     breakers = {"p","div","li","br","tr","td","th","dd","dt"}
-    texts = []
+    parts = []
     def walk(el):
         if isinstance(el, NavigableString):
-            s = str(el)
-            if s:
-                texts.append(s)
+            if str(el):
+                parts.append(str(el))
             return
-        if not isinstance(el, Tag):
-            return
+        if not isinstance(el, Tag): return
         for c in el.children:
             walk(c)
         if el.name in breakers:
-            texts.append("\n")
+            parts.append("\n")
     walk(tmp)
-    txt = "".join(texts)
-    # normalize whitespace
+    txt = "".join(parts)
     txt = re.sub(r"\r", "", txt)
     txt = re.sub(r"[ \t\f\v]+\n", "\n", txt)
     txt = re.sub(r"\n{2,}", "\n", txt)
     return txt.strip()
 
 # ---------------- Parsers ----------------
+TERM_SPLIT_RE = re.compile(rf"^\s*(.+?)\s*(?:{DASH_CLASS})\s*(.+?)\s*$")
+
+def parse_inline_block_accum(text_block: str) -> list[dict]:
+    """Stateful 'Term — Definition' parser that glues wrapped lines until next term."""
+    lines = [l.strip() for l in text_block.splitlines() if l.strip() and l.strip() not in {"* * *","***"}]
+    items = []
+    cur_term = None
+    cur_def = []
+
+    def flush():
+        nonlocal cur_term, cur_def
+        if cur_term:
+            definition = " ".join(cur_def).strip()
+            if 2 <= len(cur_term) <= 200 and len(definition) >= 5:
+                items.append({"term": cur_term, "definition": definition})
+        cur_term, cur_def = None, []
+
+    for line in lines:
+        m = TERM_SPLIT_RE.match(line)
+        if m:
+            flush()
+            cur_term = m.group(1).strip().rstrip(".:;")
+            cur_def = [m.group(2).strip()]
+        else:
+            if cur_term:
+                cur_def.append(line)
+            else:
+                # ignore preamble lines
+                continue
+    flush()
+    return items
+
 def parse_table_term_defs(container: Tag) -> list[dict]:
     out = []
     for table in container.find_all("table"):
         for tr in table.find_all("tr"):
             tds = tr.find_all(["td","th"])
-            if len(tds) < 2:
-                continue
+            if len(tds) < 2: continue
             left = tds[0].get_text(" ", strip=True)
             right = " ".join(td.get_text(" ", strip=True) for td in tds[1:])
             term = (left or "").strip()
@@ -188,46 +182,12 @@ def parse_dl_term_defs(container: Tag) -> list[dict]:
                 out.append({"term": term, "definition": definition})
     return out
 
-# Primary inline parser that accumulates wrapped lines until the next term
-TERM_SPLIT_RE = re.compile(rf"^\s*(.+?)\s*(?:{DASH_CLASS})\s*(.+?)\s*$")
-
-def parse_inline_block_accum(text_block: str) -> list[dict]:
-    lines = [l.strip() for l in text_block.splitlines() if l.strip() and l.strip() not in {"* * *", "***"}]
-    items = []
-    cur_term = None
-    cur_def = []
-
-    def flush():
-        nonlocal cur_term, cur_def
-        if cur_term:
-            definition = " ".join(cur_def).strip()
-            if 2 <= len(cur_term) <= 200 and len(definition) >= 5:
-                items.append({"term": cur_term, "definition": definition})
-        cur_term, cur_def = None, []
-
-    for line in lines:
-        m = TERM_SPLIT_RE.match(line)
-        if m:
-            # new term starts → flush previous
-            flush()
-            cur_term = m.group(1).strip().rstrip(".:;")
-            cur_def = [m.group(2).strip()]
-        else:
-            # continuation of previous definition
-            if cur_term:
-                cur_def.append(line)
-            else:
-                # ignore preamble sentences like "the following terms have the indicated meanings"
-                continue
-    flush()
-    return items
-
 def dedup_terms(items: list[dict]) -> list[dict]:
     dedup = OrderedDict()
     for item in items:
         t = (item.get("term") or "").strip()
         d = (item.get("definition") or "").strip()
-        if not t or not d:
+        if not t or not d: 
             continue
         k = t.lower()
         if (k not in dedup) or (len(d) > len(dedup[k]["definition"])):
@@ -235,33 +195,64 @@ def dedup_terms(items: list[dict]) -> list[dict]:
     return list(dedup.values())
 
 # ---------------- Extraction core ----------------
+def find_sentinel_anchor(soup: BeautifulSoup) -> Tag | None:
+    # The filing uses: “the following terms have the indicated meanings:”
+    sentinel = soup.find(string=re.compile(r"following terms have the indicated meanings", re.I))
+    if isinstance(sentinel, NavigableString) and isinstance(sentinel.parent, Tag):
+        return sentinel.parent
+    return None
+
+def best_special_terms_anchor(soup: BeautifulSoup, headings: list[str]) -> Tag | None:
+    # Prefer the sentinel sentence; fall back to closest “Special Terms” that yields pairs.
+    anchor = find_sentinel_anchor(soup)
+    if anchor:
+        return anchor
+
+    labels = set(norm_text(x) for x in headings) | {"special terms"}
+    candidates = []
+    for tag in soup.find_all(True):
+        if tag.name in SKIP_TAGS: 
+            continue
+        text = norm_text(tag.get_text(" ", strip=True))
+        if text in labels and not looks_like_toc_or_nav(tag):
+            candidates.append(tag)
+
+    # Score candidates by how many term pairs appear in their slice
+    def score_anchor(tag: Tag) -> int:
+        nodes = nodes_until_next_heading(tag)
+        if not nodes: return 0
+        text_block = html_slice_to_text_with_breaks(nodes)
+        return sum(1 for ln in text_block.splitlines() if TERM_SPLIT_RE.match(ln))
+
+    if candidates:
+        candidates.sort(key=score_anchor, reverse=True)
+        if score_anchor(candidates[0]) > 0:
+            return candidates[0]
+    return None
+
 def extract_special_terms(raw_html: str, headings: list[str]) -> tuple[list[dict], str]:
-    """
-    Returns (terms, debug_html_slice)
-    """
+    """Returns (terms, debug_html_slice)."""
     soup = BeautifulSoup(raw_html, "lxml")
-    anchor = find_special_terms_anchor(soup, headings)
+    anchor = best_special_terms_anchor(soup, headings)
     debug_slice_html = ""
 
     if anchor:
         nodes = nodes_until_next_heading(anchor)
         if nodes:
             debug_slice_html = "".join(str(n) for n in nodes if n is not None)
-
-            # 1) Try structural (tables/dl)
             tmp = BeautifulSoup(f"<div id='tmp'>{debug_slice_html}</div>", "lxml").find(id="tmp")
+
             results = []
+            # Structural formats (rare in this filing but supported)
             results.extend(parse_table_term_defs(tmp))
             results.extend(parse_dl_term_defs(tmp))
-
-            # 2) Always run inline accumulator on plain text with hard breaks
+            # Primary inline accumulator
             text_block = html_slice_to_text_with_breaks(nodes)
             results.extend(parse_inline_block_accum(text_block))
-
             if results:
                 return dedup_terms(results), debug_slice_html
 
-    # Last-resort text window (between "Special Terms" and next major heading keyword)
+    # Last-resort: text window between “Special Terms” and next major heading keyword
     full_text = (soup.body or soup).get_text("\n", strip=True)
     m_start = re.search(r"\bSpecial\s+Terms\b", full_text, flags=re.I)
     if m_start:
@@ -280,12 +271,12 @@ st.title("EDGAR — Extract Special Terms & Definitions")
 
 with st.sidebar:
     st.header("Input")
-    ua_default = "YourOrg YourApp/1.0 (your.email@yourorg.com)"
+    ua_default = "YourOrg YourApp/1.0 (name@example.com)"
     user_agent = st.text_input("HTTP User-Agent (required for SEC URLs)", value=ua_default)
     mode = st.radio("Mode", ["URL", "Upload HTML"], horizontal=True)
 
     if mode == "URL":
-        url_val = st.text_input("SEC filing URL", placeholder="https://www.sec.gov/Archives/...")
+        url_val = st.text_input("SEC filing URL", value="", placeholder="https://www.sec.gov/Archives/...")
         run_btn = st.button("Extract terms")
     else:
         html_file = st.file_uploader("Upload HTML", type=["html","htm"])
@@ -295,7 +286,7 @@ with st.sidebar:
     head_input = st.text_area(
         "Glossary/Terms headings (one per line)",
         "\n".join(DEFAULT_GLOSSARY_HEADINGS),
-        help="Labels used to find the Special Terms section."
+        help="Labels used to find the Special Terms section (fallback)."
     )
     glossary_heads = [h.strip() for h in head_input.splitlines() if h.strip()]
 
@@ -325,34 +316,27 @@ if raw_html:
         st.dataframe([{"term": t["term"], "definition": t["definition"]} for t in terms],
                      use_container_width=True)
 
-        # CSV (safe quoting)
+        # CSV download
         csv_buf = io.StringIO()
         writer = csv.writer(csv_buf)
         writer.writerow(["term", "definition"])
         for t in terms:
             writer.writerow([t["term"], t["definition"]])
-        st.download_button(
-            "Download terms (CSV)",
-            data=csv_buf.getvalue().encode("utf-8"),
-            file_name="special_terms.csv",
-            mime="text/csv"
-        )
-        # JSON
-        st.download_button(
-            "Download terms (JSON)",
-            data=json.dumps(terms, ensure_ascii=False, indent=2).encode("utf-8"),
-            file_name="special_terms.json",
-            mime="application/json"
-        )
-    else:
-        st.error("No Special Terms detected. See debug slice below to confirm what was captured.")
+        st.download_button("Download terms (CSV)",
+                           data=csv_buf.getvalue().encode("utf-8"),
+                           file_name="special_terms.csv", mime="text/csv")
 
-    # Debug preview of the captured slice under "Special Terms"
+        # JSON download
+        st.download_button("Download terms (JSON)",
+                           data=json.dumps(terms, ensure_ascii=False, indent=2).encode("utf-8"),
+                           file_name="special_terms.json", mime="application/json")
+    else:
+        st.error("No Special Terms detected. See the debug slice below to confirm what was captured.")
+
     st.markdown("#### Debug: Captured 'Special Terms' slice (HTML)")
     if debug_slice:
-        st.code(debug_slice[:5000], language="html")
+        st.code(debug_slice[:6000], language="html")
     else:
         st.caption("No slice captured (anchor not found).")
-
 else:
     st.info("Enter a URL or upload an HTML file, then click **Extract terms**.")

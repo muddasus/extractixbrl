@@ -1,16 +1,20 @@
-# app_terms_only.py — Section-aware Special Terms / Glossary extractor with exclusions
+# app_terms_only.py — Section-aware extractor + hyperlink + popover
 import re
 import io
 import csv
 import json
+import html
 import streamlit as st
+import streamlit.components.v1 as components
 from bs4 import BeautifulSoup, Tag, NavigableString
 from collections import OrderedDict
 from urllib.parse import urlparse
 import requests
 from requests.adapters import HTTPAdapter, Retry
 
-# ---------------- HTTP (SEC-friendly) ----------------
+# =========================
+# HTTP (SEC-friendly)
+# =========================
 def fetch_html(source: str, user_agent: str) -> str:
     parsed = urlparse(source)
     if parsed.scheme not in ("http", "https"):
@@ -39,10 +43,11 @@ def fetch_html(source: str, user_agent: str) -> str:
     r.encoding = r.encoding or r.apparent_encoding
     return r.text
 
-# ---------------- Text conversion ----------------
-def html_to_text_with_breaks(html: str) -> str:
-    """Convert body HTML to plain text with hard breaks at p/br/li/tr/td/th/dt/dd."""
-    soup = BeautifulSoup(html, "lxml")
+# =========================
+# HTML → text with hard breaks (for parsing)
+# =========================
+def html_to_text_with_breaks(html_str: str) -> str:
+    soup = BeautifulSoup(html_str, "lxml")
     root = soup.body or soup
     breakers = {"p","div","li","br","tr","td","th","dd","dt"}
     parts = []
@@ -62,29 +67,21 @@ def html_to_text_with_breaks(html: str) -> str:
     txt = re.sub(r"\n{2,}", "\n", txt)
     return txt.strip()
 
-# ---------------- Headings / Sections ----------------
-GOOD_SECTION_LABELS = {
-    "special terms", "glossary", "definitions", "defined terms"
-}
-BAD_SECTION_LABELS = {
-    "appendix", "appendix a", "appendix b", "appendix c", "table of contents"
-}
+# =========================
+# Headings / Sectionization
+# =========================
+GOOD_SECTION_LABELS = {"special terms", "glossary", "definitions", "defined terms"}
+BAD_SECTION_LABELS  = {"appendix", "appendix a", "appendix b", "appendix c", "table of contents"}
 
 def is_heading_line(line: str) -> bool:
-    """Heuristic: short, title-like line (no trailing period), often Title Case or ALL CAPS."""
     s = line.strip()
     if not s or len(s) > 120: return False
     if s.endswith("."): return False
-    # many headings are short (<= 8–10 words)
-    if len(s.split()) <= 10:
-        # looks like title or all caps
-        if s == s.upper():
-            return True
-        # Title-ish (Most Words Capitalized)
-        cap_like = sum(1 for w in s.split() if w[:1].isupper())
-        if cap_like >= max(2, len(s.split())//2):
-            return True
-    # obvious keywords
+    if s == s.upper() and len(s.split()) <= 14:
+        return True
+    cap_like = sum(1 for w in s.split() if w[:1].isupper())
+    if len(s.split()) <= 10 and cap_like >= max(2, len(s.split())//2):
+        return True
     sn = s.lower()
     if any(k in sn for k in ["special terms", "glossary", "definitions", "defined terms",
                               "appendix", "table of contents"]):
@@ -92,34 +89,27 @@ def is_heading_line(line: str) -> bool:
     return False
 
 def split_into_sections(lines: list[str]):
-    """
-    Split the document into (heading_text, start_idx, end_idx, lines_slice).
-    A 'heading' is a line that looks heading-like by heuristic.
-    """
-    # collect heading indices
     heads = []
     for i, ln in enumerate(lines):
         if is_heading_line(ln):
             heads.append((i, ln.strip()))
-    # add sentinel end
     heads.append((len(lines), "__END__"))
     sections = []
     for k in range(len(heads)-1):
         i, title = heads[k]
         j, _ = heads[k+1]
-        # section content starts after the heading line
         if j > i+1:
             sections.append((title, i, j, lines[i+1:j]))
     return sections
 
-# ---------------- Parsing ----------------
-# Unicode dashes: em (—), en (–), minus (−), hyphen (‐), nb-hyphen (-). Place ASCII '-' at end.
-DASH_CHARS = "\u2014\u2013\u2212\u2010\u2011\u2012"
+# =========================
+# Parsing (dash / colon / dot styles)
+# =========================
+DASH_CHARS = "\u2014\u2013\u2212\u2010\u2011\u2012"  # em/en/minus/hyphen variants
 DASH_CLASS = f"[{DASH_CHARS}:-]"
 
 DASH_RE  = re.compile(rf"^\s*(.+?)\s*{DASH_CLASS}\s*(.+?)\s*$")
 COLON_RE = re.compile(r"^\s*(.+?)\s*:\s*(.+?)\s*$")
-# Dot style: “Term. Definition”
 DOT_RE   = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9()&'\/\-\s]{0,120}?)\.\s+(.*)$")
 
 def try_match_term_line(line: str):
@@ -137,7 +127,6 @@ def try_match_term_line(line: str):
     return None
 
 def parse_accumulated(lines):
-    """Stateful parser: new term starts on a recognized line; following lines join the definition until next term."""
     items, cur_term, cur_def = [], None, []
     def flush():
         nonlocal cur_term, cur_def
@@ -165,10 +154,6 @@ def parse_accumulated(lines):
     return items
 
 def longest_term_run(all_lines, min_terms_in_run=4, max_gap=3):
-    """
-    Find the longest contiguous run that yields term/definition pairs.
-    Allow up to 'max_gap' non-matching lines between term lines (for wrapped definitions).
-    """
     best = (0, 0, [])
     n = len(all_lines)
     i = 0
@@ -197,17 +182,22 @@ def longest_term_run(all_lines, min_terms_in_run=4, max_gap=3):
         i = max(j, i + 1)
     return best
 
-# ---------------- Exclusions ----------------
+# =========================
+# Exclusions
+# =========================
 DEFAULT_EXCLUDE_TERMS = {
     "appendix", "appendix a", "appendix b", "appendix c",
-    "administrative office",  # noisy address-style glossary items
+    "administrative office",
     "table of contents",
 }
-EXCLUDE_PREFIXES = ("appendix ",)  # e.g., "Appendix A", "Appendix B"
+EXCLUDE_PREFIXES = ("appendix ",)
 EXCLUDE_REGEXES = [
     re.compile(r"^appendix\b", re.I),
     re.compile(r"^table of contents\b", re.I),
 ]
+
+# Fund-name heuristics: words like Fund/Portfolio/Trust/Series/Index nearby
+FUND_TOKENS = re.compile(r"\b(Fund|Portfolio|Trust|Series|Index|ETF|Variable Product Trust|VIP)\b", re.I)
 
 def should_exclude_term(term: str, definition: str, extra_exclusions: set[str]) -> bool:
     t = (term or "").strip().lower()
@@ -218,41 +208,31 @@ def should_exclude_term(term: str, definition: str, extra_exclusions: set[str]) 
         return True
     for rx in EXCLUDE_REGEXES:
         if rx.search(term): return True
-    # simple address heuristics (avoid PO Boxes / admin addresses)
     if re.search(r"\bP\.?\s*O\.?\s*Box\b", definition, re.I): return True
     if re.search(r"\bCustomer Service\b", definition, re.I): return True
     return False
 
-# ---------------- Extraction (section-aware + fallback) ----------------
+# =========================
+# Extraction: section-aware + fallback
+# =========================
 def extract_special_terms_section_aware(raw_html: str, extra_exclusions: set[str]):
-    """
-    1) Convert entire body to line-broken text.
-    2) Split into sections using heading-like heuristics.
-    3) Prefer sections with GOOD_SECTION_LABELS; skip BAD_SECTION_LABELS.
-    4) Inside each candidate section, take the longest term run.
-    5) If none found, fallback to global longest run.
-    6) Apply exclusions; dedupe; return items and debug info.
-    """
     text = html_to_text_with_breaks(raw_html)
     if not text:
         return [], "", ""
-
     lines = [l.strip() for l in text.splitlines() if l.strip()]
     sections = split_into_sections(lines)
 
-    best_overall = ([], ("", 0, 0))  # (items, (title, start_idx, end_idx))
+    best_overall = ([], ("", 0, 0))
     for title, i, j, slice_lines in sections:
         title_norm = title.strip().lower()
-        # Skip bad sections outright
         if any(lbl == title_norm for lbl in BAD_SECTION_LABELS) or any(title_norm.startswith(lbl) for lbl in BAD_SECTION_LABELS):
             continue
-        # Prefer only good headings; if not good, still allow but with lower priority
         good = any(lbl in title_norm for lbl in GOOD_SECTION_LABELS)
 
         start, end, items = longest_term_run(slice_lines, min_terms_in_run=3 if good else 5, max_gap=3)
         if items:
-            # filter & dedupe
             items = [it for it in items if not should_exclude_term(it["term"], it["definition"], extra_exclusions)]
+            # dedupe
             dedup = OrderedDict()
             for it in items:
                 k = it["term"].strip().lower()
@@ -262,7 +242,6 @@ def extract_special_terms_section_aware(raw_html: str, extra_exclusions: set[str
                     dedup[k] = {"term": it["term"].strip(), "definition": v}
             items = list(dedup.values())
             if items:
-                # prefer good sections; otherwise choose the one with more items
                 take = False
                 if not best_overall[0]:
                     take = True
@@ -274,14 +253,14 @@ def extract_special_terms_section_aware(raw_html: str, extra_exclusions: set[str
                     elif good == prev_good and len(items) > len(prev_items):
                         take = True
                 if take:
-                    best_overall = (items, (title, i+1+start, i+1+end))  # map back to global indices
+                    best_overall = (items, (title, i+1+start, i+1+end))
 
     if best_overall[0]:
         items, (title, start_idx, end_idx) = best_overall
         debug_slice = "\n".join(lines[start_idx:end_idx])
         return items, title, debug_slice
 
-    # ---- Fallback: global longest run across the entire doc ----
+    # global fallback
     start, end, items = longest_term_run(lines, min_terms_in_run=4, max_gap=3)
     if items:
         items = [it for it in items if not should_exclude_term(it["term"], it["definition"], extra_exclusions)]
@@ -297,9 +276,186 @@ def extract_special_terms_section_aware(raw_html: str, extra_exclusions: set[str
 
     return [], "", ""
 
-# ---------------- Streamlit UI ----------------
-st.set_page_config(page_title="EDGAR Special Terms / Glossary Extractor", layout="wide")
-st.title("EDGAR — Extract Special Terms & Definitions (Section-aware)")
+# =========================
+# Hyperlinking / Popover decorator
+# =========================
+EXCLUDED_ANCESTOR_TAGS = {"script","style","a","title","head"}
+HEADING_TAGS = {"h1","h2","h3","h4","h5","h6"}
+
+def is_heading_like_tag(tag: Tag) -> bool:
+    if tag.name in HEADING_TAGS:
+        return True
+    # treat short, all-caps blocks as headings
+    txt = (tag.get_text(" ", strip=True) or "")
+    if txt and len(txt) <= 120 and txt == txt.upper():
+        return True
+    return False
+
+def build_term_patterns(terms: list[dict]):
+    # Sort by length desc to avoid partial shadowing (e.g., "Account" before "Account Value")
+    sorted_terms = sorted(terms, key=lambda t: len(t["term"]), reverse=True)
+    compiled = []
+    for t in sorted_terms:
+        term = t["term"]
+        # word boundary-ish: allow punctuation around, but avoid mid-word matches
+        pattern = re.compile(rf"(?<!\w)({re.escape(term)}) (?!\w)|(?<!\w)({re.escape(term)})(?!\w)", re.IGNORECASE)
+        # The above handles cases with or without trailing space via two alternations; simpler match group use
+        compiled.append((term, t["definition"], pattern))
+    return compiled
+
+def _should_skip_match_context(s: str, start: int, end: int) -> bool:
+    """
+    Simple fund-name context guard:
+    - If the 3 words to the right OR left contain Fund/Portfolio/Trust/Series/Index, skip.
+    """
+    left_ctx  = s[max(0, start-80):start]
+    right_ctx = s[end:min(len(s), end+80)]
+    context = left_ctx + " " + right_ctx
+    if FUND_TOKENS.search(context):
+        return True
+    return False
+
+def decorate_html_with_terms(raw_html: str, terms: list[dict]) -> str:
+    if not terms:
+        return raw_html
+
+    soup = BeautifulSoup(raw_html, "lxml")
+    body = soup.body or soup
+    patterns = build_term_patterns(terms)
+
+    # Walk all text nodes, skipping headings/excluded containers
+    text_nodes = []
+    for el in body.find_all(text=True):
+        parent = el.parent
+        if not isinstance(parent, Tag): continue
+        if parent.name in EXCLUDED_ANCESTOR_TAGS: continue
+        # skip if inside a heading-like element
+        heading_ancestor = False
+        for anc in parent.parents:
+            if isinstance(anc, Tag):
+                if anc.name in EXCLUDED_ANCESTOR_TAGS: 
+                    heading_ancestor = True; break
+                if is_heading_like_tag(anc):
+                    heading_ancestor = True; break
+        if heading_ancestor: continue
+        text_nodes.append(el)
+
+    # Replace in each text node (marker strategy to avoid nested soups)
+    MARKER_PREFIX = "\uFFF0TERM"
+    marker_counter = 0
+
+    for node in text_nodes:
+        s = str(node)
+        original = s
+        replacements = []  # (marker, display_text, term_lower, definition)
+        # For each pattern, replace with a unique marker via callback
+        for term, definition, pat in patterns:
+            def cb(m):
+                nonlocal marker_counter
+                span_text = m.group(0)
+                # Determine exact matched display text (remove trailing alt)
+                disp = m.group(1) or m.group(2) or span_text
+                start = m.start()
+                end = m.end()
+                # Context test to avoid fund names
+                if _should_skip_match_context(s, start, end):
+                    return span_text
+                marker = f"{MARKER_PREFIX}{marker_counter}\uFFF1"
+                marker_counter += 1
+                replacements.append((marker, disp, term.lower(), definition))
+                return marker
+            s = pat.sub(cb, s)
+        if s != original and replacements:
+            # Build HTML with markers replaced by spans
+            for marker, disp, term_lower, definition in replacements:
+                safe_disp = html.escape(disp)
+                safe_def  = html.escape(definition)
+                span_html = (f'<span class="st-term" tabindex="0" role="button" '
+                             f'data-term="{safe_disp}" data-def="{safe_def}">{safe_disp}</span>')
+                s = s.replace(marker, span_html)
+            frag = BeautifulSoup(s, "lxml")
+            node.replace_with(frag)
+
+    # Inject CSS/JS for popovers
+    inject_popover_assets(soup)
+    return str(soup)
+
+def inject_popover_assets(soup: BeautifulSoup):
+    style = """
+<style>
+.st-term { text-decoration: underline dotted; cursor: pointer; }
+.st-pop { position: absolute; z-index: 99999; max-width: 420px;
+          background: #111827; color: #F9FAFB; border: 1px solid #374151;
+          border-radius: 10px; padding: 12px 14px; box-shadow: 0 8px 30px rgba(0,0,0,.25); }
+.st-pop .st-term-title { font-weight: 700; margin: 0 0 6px 0; font-size: 14px; }
+.st-pop .st-term-def { font-size: 13px; line-height: 1.35; }
+.st-pop .st-close { position: absolute; top: 6px; right: 8px; border: 0; background: transparent;
+                    color: #9CA3AF; cursor: pointer; font-size: 14px; }
+.st-pop .st-close:hover { color: #E5E7EB; }
+</style>
+"""
+    script = """
+<script>
+(function(){
+  let current;
+  function closePop() {
+    if (current && current.parentNode) current.parentNode.removeChild(current);
+    current = null;
+  }
+  document.addEventListener('click', function(e){
+    // Click outside → close
+    if (current && !e.target.closest('.st-pop') && !e.target.classList.contains('st-term')) {
+      closePop();
+    }
+  });
+  document.addEventListener('keydown', function(e){
+    if (e.key === 'Escape') closePop();
+  });
+  document.addEventListener('click', function(e){
+    const el = e.target.closest('.st-term');
+    if (!el) return;
+    e.preventDefault();
+    const term = el.getAttribute('data-term') || '';
+    const def  = el.getAttribute('data-def') || '';
+    closePop();
+
+    const pop = document.createElement('div');
+    pop.className = 'st-pop';
+    pop.innerHTML = `
+      <button class="st-close" aria-label="Close">✕</button>
+      <div class="st-term-title">${term}</div>
+      <div class="st-term-def">${def}</div>
+    `;
+    document.body.appendChild(pop);
+
+    const rect = el.getBoundingClientRect();
+    const popRect = pop.getBoundingClientRect();
+    let top = window.scrollY + rect.bottom + 6;
+    let left = window.scrollX + rect.left;
+    if (left + popRect.width > window.scrollX + window.innerWidth - 12) {
+      left = window.scrollX + window.innerWidth - popRect.width - 12;
+    }
+    if (top + popRect.height > window.scrollY + window.innerHeight - 12) {
+      top = window.scrollY + rect.top - popRect.height - 6;
+    }
+    pop.style.top = top + 'px';
+    pop.style.left = left + 'px';
+    current = pop;
+
+    pop.querySelector('.st-close').addEventListener('click', closePop);
+  });
+})();
+</script>
+"""
+    head = soup.head or soup
+    head.append(BeautifulSoup(style, "lxml"))
+    head.append(BeautifulSoup(script, "lxml"))
+
+# =========================
+# Streamlit UI
+# =========================
+st.set_page_config(page_title="EDGAR — Special Terms with Popovers", layout="wide")
+st.title("EDGAR — Hyperlink Special Terms with Popovers")
 
 with st.sidebar:
     st.header("Input")
@@ -308,16 +464,16 @@ with st.sidebar:
     mode = st.radio("Mode", ["URL", "Upload HTML"], horizontal=True)
     if mode == "URL":
         url_val = st.text_input("SEC filing URL", placeholder="https://www.sec.gov/Archives/...")
-        run_btn = st.button("Extract terms")
+        run_btn = st.button("Process filing")
     else:
         html_file = st.file_uploader("Upload HTML", type=["html","htm"])
-        run_btn = st.button("Extract terms from upload")
+        run_btn = st.button("Process uploaded HTML")
 
-    st.header("Filters")
+    st.header("Exclusions")
     excl_text = st.text_area(
-        "Extra terms to exclude (one per line, case-insensitive)",
+        "Extra terms to exclude from linking (one per line, case-insensitive)",
         "Administrative Office\nAppendix A\nAppendix B\nAppendix C",
-        help="These terms will be dropped even if they parse as glossary entries."
+        help="These will not be extracted OR linked."
     )
     extra_exclusions = {ln.strip().lower() for ln in excl_text.splitlines() if ln.strip()}
 
@@ -337,17 +493,22 @@ if run_btn:
     except Exception as e:
         st.error(f"Failed to load HTML: {e}")
 
-if raw_html:
-    with st.spinner("Finding the Special Terms / Glossary block…"):
-        terms, where_title, debug_text = extract_special_terms_section_aware(raw_html, extra_exclusions)
+# ====== Extraction core (reused from your section-aware extractor) ======
+def extract_terms_for_linking(html_str: str, extra_exclusions: set[str]) -> list[dict]:
+    terms, where_title, _ = extract_special_terms_section_aware(html_str, extra_exclusions)
+    return terms
 
-    st.subheader("Results")
+if raw_html:
+    with st.spinner("Extracting terms…"):
+        terms = extract_terms_for_linking(raw_html, extra_exclusions)
+
+    st.subheader("Extracted Special Terms")
     if terms:
-        st.success(f"Found {len(terms)} terms from section: **{where_title or 'N/A'}**")
+        st.success(f"Found {len(terms)} terms.")
         st.dataframe([{"term": t["term"], "definition": t["definition"]} for t in terms],
                      use_container_width=True)
 
-        # CSV
+        # downloads
         csv_buf = io.StringIO()
         writer = csv.writer(csv_buf)
         writer.writerow(["term", "definition"])
@@ -355,21 +516,18 @@ if raw_html:
             writer.writerow([t["term"], t["definition"]])
         st.download_button("Download terms (CSV)",
                            data=csv_buf.getvalue().encode("utf-8"),
-                           file_name="special_terms.csv",
-                           mime="text/csv")
-
-        # JSON
+                           file_name="special_terms.csv", mime="text/csv")
         st.download_button("Download terms (JSON)",
                            data=json.dumps(terms, ensure_ascii=False, indent=2).encode("utf-8"),
-                           file_name="special_terms.json",
-                           mime="application/json")
-    else:
-        st.error("No Special Terms / Glossary block detected. See the debug slice below.")
+                           file_name="special_terms.json", mime="application/json")
 
-    st.markdown("#### Debug: Detected block (text)")
-    if debug_text:
-        st.code(debug_text[:8000], language="text")
+        with st.spinner("Decorating HTML with popovers…"):
+            decorated_html = decorate_html_with_terms(raw_html, terms)
+
+        st.subheader("Filing (terms hyperlinked)")
+        # Render full HTML with JS/CSS
+        components.html(decorated_html, height=900, scrolling=True)
     else:
-        st.caption("No contiguous run of term/definition lines found.")
+        st.error("No terms found to link. Try adjusting exclusions or check the debug slice in your earlier run.")
 else:
-    st.info("Enter a URL or upload an HTML file, then click **Extract terms**.")
+    st.info("Enter a URL or upload an HTML file, then click **Process filing**.")
